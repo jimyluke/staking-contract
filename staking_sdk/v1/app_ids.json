@@ -1,0 +1,8 @@
+{
+    "testnet": {
+        "APP_ID": 0
+    },
+    "mainnet": {
+        "APP_ID": 0
+    }
+}

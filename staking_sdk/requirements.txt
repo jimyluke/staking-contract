@@ -1,0 +1,1 @@
+py_algorand_sdk==1.9.0

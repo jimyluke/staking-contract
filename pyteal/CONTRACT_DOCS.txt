@@ -1,0 +1,210 @@
+STAKING CONTRACT DOCUMENTATION
+
+Before compiling the pyTeal (running staking_contract.py or deploy_contract.py), the MANAGER and MAX_SECONDS_TO_CLAIM constants must be set. Reading this documentation will explain what these two features are.
+After the contract has been deployed it's needed to fund the escrow with 0.1 ALGO, to start interacting with it.
+All the amounts passed as argument or transfered are in base units
+
+This is a staking contract that allows to manage up to 63 staking pools of different ASAs, without having a backend that manages them, all is completely decentralized and stored in one application.
+The contract must be created hardcoding a manager address (Using the constant MANAGER in the pyTeal source before compiling). This address will be the only one responsible to create and delete pools.
+During the contract deplyment a global key "INFO" will be stored and the associated value is the bytes concatenation of:
+    - the manager address (MG) 32 bytes
+    - the number of the pools currently created (POOL_NUM) 8 bytes, big endian uint64
+
+    KEY                           VALUE
+┌────────┐     ┌──────────────────────────────────────┐
+│ "INFO" │     │             MG            | POOL_NUM │
+               0                          32          40
+
+Before creating a pool will be needed to let the escrow account opt in to the asa, if not alredy. The contract have an interface for it that will be explained below.
+Once a pool has been successfully created a new key-value pair will be added in the contract global state.
+The key is the bytes value of an uint64 rapresenting the logical POOL_ID, that by design is the timestamp of the pool creation time (to be unique for every pool).
+The value associated to this key is the byte concatenation of a few big endian uint64, in this order:
+    - the total rewards that has been put in the pool during the creation (TR)
+    - the number of unique users that are currently staking (UN)
+    - the amount of rewards to be claimed (TBC)
+    - the total amount that has been staked (TS)
+    - the total score of the pool, needed to calculate the rewards (TSC)
+    - the timestamp of the start time (ST)
+    - the time delta, the seconds of the duration of the pool (TD), such that ST + TD = ending timestamp
+    - the asa id of the asset that the pool requires to stake (CID_G)
+
+   KEY                                  VALUE
+┌───────┐     ┌──────────────────────────────────────────────────────────┐
+│POOL_ID│     │  TR  |  UN  |  TBC  |  TS  |  TSC  |  ST  |  TD  | CID_G │
+0       8     0      8      16     24     32      40     48      56     64 <-- To read the single values is needed to extract the respective bytes from the global state
+                                                                               and convert that slice to a big endian uint64 
+                                                                               (upon decoding from base64 the whole value string read from global state)
+
+For each pool successfully created there will be added a new key-value pair like this.
+
+The manager address (MG) has the possibility to delete a pool by giving the POOL_ID. This will only be possible if one of these two conditions happens:
+    - All the users have claimed the rewards (i.e. when the UN value is 0).
+    - MAX_SECONDS_TO_CLAIM, which has to be set in the pyTeal, seconds passed after the pool is ended.
+If the manager deletes the pool because of the second condition this will only remove the non-claimed rewards (TBC) and not the amount deposited by the users that have not claimed yet.
+Users will be able to withdraw the deposited amount at any time if the pool is deleted.
+This has been done to help cleaning the space in the contract and give the possibility to remove pools that maybe has been forgotten by the depositors. In any case this option can be easily removed before the contract deployment.
+
+Following the explaination on the interfaces and the transaction groups that will be needed to broadcast in order to interact with the contract:
+
+    escrow_opt_in:
+        desc: Let the escrow account opt in the asa_id specified in the foreign_assets array of the AppCall.
+              This is mandatory before a pool creation if the escrow account is not opted in, otherwhise the pool creation call will fail.
+              This action is only accessible by the MG address and fails if the escrow is already opted in.
+
+        tx group:
+            Pay:
+                receiver: app_address
+                amount: 101000
+            AppCall:
+                index: app_id
+                foreign_assets: [asa_id]
+                app_args: [bytes("OI", "utf-8")]
+
+        on completetion: The escrow address is opted in asa_id
+
+    create_pool:
+        desc: Create a staking pool of the asa_id specified in the foreign_assets array and in the Axfer transaction with total_rewards to distribute.
+              The seconds argument in the app_args array is the timestamp of when the pool should start (but users are able to deposit as soon as the pool has been created).
+              If the start_time is less than the current timestamp, the pool will start immediately after the pool creation (i.e. if it is wanted to start immediately, it's possible to use a start_time of 0).
+              The third argument in the app_args is the time_delta. This are the seconds such that start_time + time_delta = ending timestamp, so it is the pool's duration in seconds.
+              This action is only accessible by the MG address and fails if the escrow is not opted in the asa_id or if alredy exist a pool created with the same timestamp (POOL_ID)
+        
+        tx group:
+            Axfer:
+                receiver: app_address
+                asset_amount: total_rewards
+                asset_id: asa_id
+            AppCall:
+                index: app_id
+                foreign_assets: [asa_id]
+                app_args: [bytes("CP", "utf-8"), intToBytes(start_time), intToBytes(time_delta)]
+
+        on completetion: Creates a key-value pair in the global state as specified previously.
+                         Increases the POOL_NUM value by 1 in the global key "INFO".
+                         Starts the pool if start_time passed is less than the current timestamp of when the call is executed.
+
+    delete_pool:
+        desc: Deletes the specified pool (POOL_ID), the correspondent asa_id must be specified in the foreign_assets array.
+              Must override the txn fee param to 2000.
+              This action is only accessible by the MG address in the conditions explained previously.
+        
+        txn:
+            AppCall:
+                params.flat_fee: True
+                params.fee = 2000
+                index: app_id
+                foreign_assets: [asa_id]
+                app_args: [bytes("DL", "utf-8"), intToBytes(POOL_ID)]
+
+        on completetion: Deletes the POOL_ID key-value pair in the global state.
+                         Decreses the POOL_NUM value by one in the global key "INFO"
+                         Sends to the MG address the amount that has not been claimed in the pool (can be a residue due to truncate divisions during the rewards dispaching)
+
+
+Now comes the user side.
+The user must be opted in the staking application, since it will be necessary to write on the local state.
+A user is able to deposit in a staking pool at any time, multiple times, but only claim (amount deposited + rewards) when the pool is ended.
+When he deposits before the pool has started his partecipation will be counted as complete.
+If he deposites after it will be counted as partial in proportion of the time that remains until the end.
+If multiple deposits are done this will be cumulated as a score in the local state of the user's address (USC).
+The local state of the depositor is a serialized key-value pair. 
+A new key-value pair will be added when he stakes for the first time in a pool.
+The key is a big endian uint64 from 1 to 4, the value is a byte concatenation of big endian uint64, each rapresenting:
+    - The logical pool id (POOL_ID) that is present in the global state (the creation pool timestamp)
+    - The total amount staked by the user (UST)
+    - The score accrued by the user (USC)
+    - The asa id of the staked asset (CID_L)
+
+The scheme follows:
+    KEY                      VALUE
+┌────────┐     ┌───────────────────────────────┐
+│  1..4  │     │POOL_ID│  UST  |  USC  | CID_L │
+0        8     0       8      16      24       32
+
+
+These are the contract interfaces allowed to any user:
+
+    deposit:
+        desc: Deposit in the pool (POOL_ID) the specified deposit_amount of the asa_id.
+              This action will fail if:
+                - the pool has ended
+                - the POOL_ID does not exist
+                - the asa_id specified is not the POOL_ID's one
+                - the user has alredy the pool slots full (4 in total by now)
+
+        tx group:
+            Axfer:
+                receiver: app_address
+                asset_amount: deposit_amount
+                asset_id: asa_id
+            AppCall:
+                index: app_id
+                foreign_assets: [asa_id]
+                app_args: [bytes("DP", "utf-8"), intToBytes(POOL_ID)]
+
+        on completetion: Creates a new key-value pair as specified if the user has never deposited in the pool. Otherwise updates the correspondent values (UST, USC).
+                         Updates the global state values TS, TSC and increases by 1 the UN value if this is the first deposit of the user in this pool.
+
+    claim:
+        desc: Claim the amount deposited with the accrued rewards for the specified pool (POOL_ID) when the pool is ended.
+              Must override the txn fee param to 2000.
+              This action will fail if:
+                - the pool does not exist (i.e. has been deleted)
+                - the address has not deposited in this pool
+                - the asa_id specified is not the POOL_ID's one
+                - the user is not opted in asa_id
+
+        txn:
+            AppCall:
+                params.flat_fee: True
+                params.fee = 2000
+                index: app_id
+                foreign_assets: [asa_id]
+                app_args: [bytes("CL", "utf-8"), intToBytes(POOL_ID)]
+
+        on completetion: Deletes the correspondent key-value pair in the user's local state.
+                         Updates the global state value TBC removing the portion sended to the user and decreases by 1 the UN value.
+                         Sends the total deposited amount + rewards to the user
+    
+    withdraw:
+        desc: withdraw the amount deposited. Possible if the pool has been deleted but the user has not claimed
+              Must override the txn fee param to 2000.
+              This action will fail if:
+                - the address has not deposited in this pool
+                - the asa_id specified is not the POOL_ID's one
+                - the user is not opted in asa_id
+
+        txn:
+            AppCall:
+                params.flat_fee: True
+                params.fee = 2000
+                index: app_id
+                foreign_assets: [asa_id]
+                app_args: [bytes("WD", "utf-8"), intToBytes(POOL_ID)]
+
+        on completetion: Deletes the correspondent key-value pair in the user's local state.
+                         Sends the total deposited amount to the user
+
+
+NOTES:
+    - The application close out is permitted only if the user hasn't staked anything in any pool when he wants to close out (i.e. the local state is empty)
+    - During the clear state, since it will in any case delete the local state, for each pool in which the caller has staked, if not deleted:
+        - the UN global field is decreased by 1
+        - the TSC global field is decreased by the USC value
+        - the TS global field is decresed by the UST value
+      This is done in order to remove the user's weight in the pools.
+    - It's possible to check that there won't be possible to encounter overflow errors when a user deposits big amounts during the pool creation process.
+      The assert in on_creation method is:
+          Len(BytesMul(Txn.application_args[2], Itob(totalSupply(Txn.assets[0])))) <= Int(8)
+  
+      This will check if the upper limit will be reached in the worst case scenario (i.e. the total supply is deposited).
+      The variable here is the time delta passed as argument (Txn.application_args[2]) at the time of pool creation. 
+      So for example for pool tokens that have 2^64 -1 total supply to avoid overflow in the worst case scenario will only be possible to use a time_delta = 1.
+      This to verify the disequation (Time Delta * Total Supply < 2**64 - 1). But a time_delta = 1 means a pool that lasts 1 second.
+      Nevertheless by default this check is commented so IT WILL NOT BE PRESENT IN THE DEPLOYED CONTRACT, unless uncommented.
+      This because the overflow will impact users that stake an amount such that time_delta*amount > 2^64 -1 (so when the USC is calculated).
+      So it will not lock any funds in the contract, just will fail during the deposit.
+      When claiming or withdrawing this operation is not done.
+      I.E. Assuming we've got an asa with 10.000.000.000 units and 6 decimals the total base units are 10.000.000.000.000.000.
+           If the check is present this will permit a max time_delta = 1844 seconds, about 30 minutes.
+           But it's considering that all the total units are staked as a worst case scenario.
